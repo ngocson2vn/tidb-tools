@@ -11,9 +11,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Show leader distribution of a TiDB table.")
     parser.add_argument("--host", dest="host", help="tidb-server address, default: 127.0.0.1", default="127.0.0.1")
     parser.add_argument("--port", dest="port", help="tidb-server status port, default: 10080", default="10080")
-    parser.add_argument("--database", help="database name")
-    parser.add_argument("--table",    help="table name")
-    parser.add_argument("--file",     help="The table regions JSON file")
+    parser.add_argument("--database", required=True, help="database name")
+    parser.add_argument("--table", required=True, help="table name")
+    parser.add_argument("--store-id", required=True, help="TiKV store id")
+    parser.add_argument("--file", help="The table regions JSON file")
     args = parser.parse_args()
     return args
 
@@ -30,15 +31,14 @@ def main():
         fdw.write(json.dumps(region_info, indent=2))
         fdw.close()
 
-    # Find target store
-    target_store_id = find_target_store(region_info["record_regions"])
-    print(f"Target store id: {target_store_id}")
-
+    # Analyze regions
+    analyze_regions(region_info["record_regions"])
 
     # Parse regions
-    parse_regions(target_store_id, region_info["record_regions"])
+    print(f"\nTarget store id: {args.store_id}\n")
+    parse_regions(int(args.store_id), region_info["record_regions"])
 
-def find_target_store(regions):
+def analyze_regions(regions):
     stores = {}
     for region in regions:
         stores.setdefault(region["leader"]["store_id"], []).append(region["leader"]["id"])
@@ -50,24 +50,25 @@ def find_target_store(regions):
         store_id_str = f"store-{store[0]}"
         print(f"{store_id_str:>20}: {len(store[1])} ({round(percent, 2)} %)")
 
-    return sorted_stores[0][0]
-
 def parse_regions(target_store_id, regions):
-    idx = 0
+    count = 0
     store_id_list = []
     region_id_list = []
     f = open("./command.sh", 'w+')
     os.chmod("./command.sh", stat.S_IRWXU|stat.S_IRGRP|stat.S_IROTH)
+    dist = open("./distribution.txt", 'w+')
+    dist.write(f"{'REGION_ID':>20} {'LEADER_STORE_ID':>20}\n")
     for region in regions:
+        dist.write(f"{region['region_id']:>20} {region['leader']['store_id']:>20}\n")
         if region["leader"]["store_id"] != None:
-            if len(store_id_list) == 5:
+            if len(store_id_list) == int(os.environ.get("REGION_ADJACENT_SIZE", 5)):
                 start_key, end_key = get_start_end_keys(region_id_list[0], region_id_list[-1])
                 if start_key and end_key:
                     f.write(f"pd-ctl scheduler add scatter-range --format=hex {start_key} {end_key} {target_store_id}-{region_id_list[0]}-{region_id_list[-1]}\n")
          
                 store_id_list.clear()
                 region_id_list.clear()
-                idx += 1
+                count += 1
             store_id = region["leader"]["store_id"]
             region_id = region["region_id"]
             if (store_id == target_store_id):
@@ -76,6 +77,9 @@ def parse_regions(target_store_id, regions):
             else:
                 store_id_list.clear()
                 region_id_list.clear()
+    f.close()
+    dist.close()
+    print(f"\nTotal generated schedulers: {count}\n")
 
 
 def get_start_end_keys(start_region_id, end_region_id):
@@ -83,7 +87,7 @@ def get_start_end_keys(start_region_id, end_region_id):
 
     start_key = None
     end_key = None
-    print(f"{pd_base_uri}/{start_region_id}")
+    print(f"GET {pd_base_uri}/{start_region_id}")
     response = requests.get(f"{pd_base_uri}/{start_region_id}")
     if response.ok:
         start_key = response.json()["start_key"]
